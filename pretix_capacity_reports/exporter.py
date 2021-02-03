@@ -5,7 +5,7 @@ from datetime import timedelta, time, datetime
 import pytz
 from dateutil.parser import parse
 from django import forms
-from django.db.models import OuterRef, Exists, Prefetch, Count, Q, Sum
+from django.db.models import OuterRef, Exists, Prefetch, Count, Q, Sum, Min, Subquery, Max, F
 from django.db.models.functions import TruncDay, Coalesce
 from django.utils.timezone import now, get_current_timezone, make_aware
 from django.utils.translation import gettext_lazy as _
@@ -14,10 +14,44 @@ from openpyxl.cell.cell import KNOWN_TYPES
 from openpyxl.utils import get_column_letter
 
 from pretix.base.exporter import MultiSheetListExporter
-from pretix.base.models import Quota, EventMetaValue, Order, OrderPosition, SubEvent, Checkin
+from pretix.base.models import Quota, EventMetaValue, Order, OrderPosition, SubEvent, Checkin, LogEntry
 
 
-class CapacityUtilizationReport(MultiSheetListExporter):
+class BaseMSLE(MultiSheetListExporter):
+    def _render_xlsx(self, form_data, output_file=None):  # vendored pretix 3.16 version
+        wb = Workbook(write_only=True)
+        n_sheets = len(self.sheets)
+        for i_sheet, (s, l) in enumerate(self.sheets):
+            ws = wb.create_sheet(str(l))
+            if hasattr(self, 'prepare_xlsx_sheet_' + s):
+                getattr(self, 'prepare_xlsx_sheet_' + s)(ws)
+
+            total = 0
+            counter = 0
+            for i, line in enumerate(self.iterate_sheet(form_data, sheet=s)):
+                if isinstance(line, self.ProgressSetTotal):
+                    total = line.total
+                    continue
+                ws.append([
+                    str(val) if not isinstance(val, KNOWN_TYPES) else val
+                    for val in line
+                ])
+                if total:
+                    counter += 1
+                    if counter % max(10, total // 100) == 0:
+                        self.progress_callback(counter / total * 100 / n_sheets + 100 / n_sheets * i_sheet)
+
+        if output_file:
+            wb.save(output_file)
+            return self.get_filename() + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', None
+        else:
+            with tempfile.NamedTemporaryFile(suffix='.xlsx') as f:
+                wb.save(f.name)
+                f.seek(0)
+                return self.get_filename() + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', f.read()
+
+
+class CapacityUtilizationReport(BaseMSLE):
     identifier = 'capacity_utilization'
     verbose_name = 'Capacity & Utilization'
     meta_name = 'AgencyNumber'
@@ -419,34 +453,167 @@ class CapacityUtilizationReport(MultiSheetListExporter):
         for i, dt in enumerate(self._week_iter()):
             ws.column_dimensions[get_column_letter(3 + i)].width = 15
 
-    def _render_xlsx(self, form_data, output_file=None):  # vendored pretix 3.16 version
-        wb = Workbook(write_only=True)
-        n_sheets = len(self.sheets)
-        for i_sheet, (s, l) in enumerate(self.sheets):
-            ws = wb.create_sheet(str(l))
-            if hasattr(self, 'prepare_xlsx_sheet_' + s):
-                getattr(self, 'prepare_xlsx_sheet_' + s)(ws)
 
-            total = 0
-            counter = 0
-            for i, line in enumerate(self.iterate_sheet(form_data, sheet=s)):
-                if isinstance(line, self.ProgressSetTotal):
-                    total = line.total
+class CapacityCreationReport(BaseMSLE):
+    identifier = 'capacity_creation'
+    verbose_name = 'Capacity creation'
+    meta_name = 'AgencyNumber'
+
+    sheets = [
+        ('date_agency', _('By date and agency')),
+    ]
+
+    @property
+    def export_form_fields(self):
+        defdate_start = now().astimezone(get_current_timezone()).date()
+        defdate_end = now().astimezone(get_current_timezone()).date() + timedelta(days=6)
+
+        # product_choices = []
+        # for r in Item.objects.filter(event__in=self.events, variations__isnull=True).values('name').distinct():
+        #    product_choices.append((str(r['name']), str(r['name'])))
+        # for r in ItemVariation.objects.filter(item__event__in=self.events).values('item__name', 'value').distinct():
+        #    product_choices.append(('{}#!#{}'.format(r['item__name'], r['value']), '{} – {}'.format(r['item__name'], r['value'])))
+
+        f = OrderedDict(
+            list(super().export_form_fields.items()) + [
+                ('date_from',
+                 forms.DateField(
+                     label=_('Start date'),
+                     widget=forms.DateInput(attrs={'class': 'datepickerfield'}),
+                     initial=defdate_start,
+                 )),
+                ('date_to',
+                 forms.DateField(
+                     label=_('End date'),
+                     widget=forms.DateInput(attrs={'class': 'datepickerfield'}),
+                     initial=defdate_end,
+                 )),
+                # ('product_name',
+                #  forms.MultipleChoiceField(
+                #      label=_('Product and variation'),
+                #      choices=product_choices,
+                #      widget=forms.CheckboxSelectMultiple(
+                #          attrs={'class': 'scrolling-multiple-choice'}
+                #      ),
+                #      initial=[r[0] for r in product_choices]
+                #  )),
+            ]
+        )
+        if self.is_multievent and self.events.first():
+            organizer = self.events.first().organizer
+            for mp in organizer.meta_properties.prefetch_related('event_values'):
+                if mp.name != self.meta_name:
                     continue
-                ws.append([
-                    str(val) if not isinstance(val, KNOWN_TYPES) else val
-                    for val in line
-                ])
-                if total:
-                    counter += 1
-                    if counter % max(10, total // 100) == 0:
-                        self.progress_callback(counter / total * 100 / n_sheets + 100 / n_sheets * i_sheet)
+                values = sorted(list({v.value for v in mp.event_values.all()}))
+                f['meta:{}'.format(mp.name)] = forms.MultipleChoiceField(
+                    label=mp.name,
+                    choices=[(v, v) for v in values],
+                    widget=forms.CheckboxSelectMultiple(
+                        attrs={'class': 'scrolling-multiple-choice'}
+                    ),
+                    initial=values,
+                )
+        return f
 
-        if output_file:
-            wb.save(output_file)
-            return self.get_filename() + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', None
+    def iterate_sheet(self, form_data, sheet):
+        if self.events.first():
+            self.tz = self.events.first().timezone
         else:
-            with tempfile.NamedTemporaryFile(suffix='.xlsx') as f:
-                wb.save(f.name)
-                f.seek(0)
-                return self.get_filename() + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', f.read()
+            self.tz = pytz.UTC
+        self.date_from = form_data['date_from']
+        self.date_until = form_data['date_to']
+        if isinstance(self.date_from, str):
+            self.date_from = parse(self.date_from).date()
+        self.datetime_from = make_aware(datetime.combine(
+            self.date_from,
+            time(hour=0, minute=0, second=0, microsecond=0)
+        ), self.tz)
+
+        if isinstance(self.date_until, str):
+            self.date_until = parse(self.date_until).date()
+        self.datetime_until = make_aware(datetime.combine(
+            self.date_until + timedelta(days=1),
+            time(hour=0, minute=0, second=0, microsecond=0)
+        ), self.tz)
+
+        if hasattr(self, 'iterate_' + sheet):
+            yield from getattr(self, 'iterate_' + sheet)(form_data)
+
+    def _date_iter(self):
+        dt = self.date_from
+        while dt <= self.date_until:
+            yield dt
+            dt += timedelta(days=1)
+
+    def iterate_date_agency(self, form_data):
+        yield [
+            "Event created", self.meta_name, "Number of Events", "Sum of Quotas", "Sum of Orders", "Sum of Checked in"
+        ]
+
+        qs = self.events.annotate(
+            creation_datetime=Subquery(
+                LogEntry.objects.filter(
+                    event=OuterRef('pk')
+                ).order_by().values('event').annotate(c=Min('datetime')).values('c')
+            ),
+            meta_value=Subquery(
+                EventMetaValue.objects.filter(
+                    property__name=self.meta_name,
+                    event=OuterRef('pk')
+                ).order_by().values('event').annotate(c=Max('value')).values('c')
+            ),
+            n_quotas=Subquery(
+                Quota.objects.filter(
+                    size__isnull=False,
+                    event=OuterRef('pk')
+                ).order_by().values('event').annotate(s=Sum('size')).values('s')
+            ),
+            n_orders=Subquery(
+                OrderPosition.objects.filter(
+                    order__event=OuterRef('pk'),
+                    order__status__in=(Order.STATUS_PAID, Order.STATUS_PENDING),
+                ).order_by().values('order__event').annotate(s=Count('*')).values('s')
+            ),
+            n_checkins=Subquery(
+                OrderPosition.objects.annotate(
+                    has_checkin=Exists(Checkin.objects.filter(position=OuterRef('pk')))
+                ).filter(
+                    has_checkin=True,
+                    order__event=OuterRef('pk'),
+                    order__status__in=(Order.STATUS_PAID, Order.STATUS_PENDING),
+                ).order_by().values('order__event').annotate(s=Count('*')).values('s')
+            ),
+        ).annotate(
+            creation_date=TruncDay(F('creation_datetime'))
+        ).filter(
+            creation_datetime__gte=self.datetime_from,
+            creation_datetime__lt=self.datetime_until,
+            meta_value__in=form_data['meta:' + self.meta_name]
+        ).order_by().values(
+            'creation_date', 'meta_value'
+        ).annotate(
+            sum_events=Count('*'),
+            sum_quotas=Sum('n_quotas'),
+            sum_orders=Sum('n_orders'),
+            sum_checkins=Sum('n_checkins'),
+        ).order_by(
+            'creation_date', 'meta_value'
+        )
+        for r in qs:
+            yield [
+                r['creation_date'].strftime('%m/%d/%Y'),
+                r['meta_value'],
+                r['sum_events'] or 0,
+                r['sum_quotas'] or 0,
+                r['sum_orders'] or 0,
+                r['sum_checkins'] or 0,
+            ]
+
+    def prepare_xlsx_sheet_date_agency(self, ws):
+        ws.freeze_panes = 'A2'
+        ws.column_dimensions['A'].width = 20
+        ws.column_dimensions['B'].width = 30
+        ws.column_dimensions['C'].width = 15
+        ws.column_dimensions['D'].width = 15
+        ws.column_dimensions['E'].width = 15
+        ws.column_dimensions['F'].width = 15
