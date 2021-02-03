@@ -1,3 +1,4 @@
+import json
 import tempfile
 from collections import OrderedDict
 from datetime import timedelta, time, datetime
@@ -5,16 +6,18 @@ from datetime import timedelta, time, datetime
 import pytz
 from dateutil.parser import parse
 from django import forms
-from django.db.models import OuterRef, Exists, Prefetch, Count, Q, Sum, Min, Subquery, Max, F
-from django.db.models.functions import TruncDay, Coalesce
+from django.db.models import OuterRef, Exists, Prefetch, Count, Q, Sum, Min, Subquery, Max, F, CharField, Value
+from django.db.models.functions import TruncDay, Coalesce, Cast, Concat
+from django.utils.functional import cached_property
 from django.utils.timezone import now, get_current_timezone, make_aware
 from django.utils.translation import gettext_lazy as _
+from i18nfield.strings import LazyI18nString
 from openpyxl import Workbook
 from openpyxl.cell.cell import KNOWN_TYPES
 from openpyxl.utils import get_column_letter
 
 from pretix.base.exporter import MultiSheetListExporter
-from pretix.base.models import Quota, EventMetaValue, Order, OrderPosition, SubEvent, Checkin, LogEntry
+from pretix.base.models import Quota, EventMetaValue, Order, OrderPosition, SubEvent, Checkin, LogEntry, Item, ItemVariation
 
 
 class BaseMSLE(MultiSheetListExporter):
@@ -50,6 +53,37 @@ class BaseMSLE(MultiSheetListExporter):
                 f.seek(0)
                 return self.get_filename() + '.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', f.read()
 
+    @cached_property
+    def product_choices(self):
+        product_choices = [('', 'All')]
+        for r in Item.objects.filter(
+            event__in=self.events, variations__isnull=True,
+        ).annotate(
+            n=Cast('name', output_field=CharField())
+        ).values('n').distinct():
+            product_choices.append((str(r['n']) + '#!#-', i18ntostring(r['n'])))
+        for r in ItemVariation.objects.filter(
+                item__event__in=self.events
+        ).annotate(
+            n=Cast('item__name', output_field=CharField()),
+            v=Cast('value', output_field=CharField())
+        ).values(
+            'n', 'v'
+        ).distinct():
+            product_choices.append(('{}#!#{}'.format(r['n'], r['v']), '{} – {}'.format(
+                i18ntostring(r['n']),
+                i18ntostring(r['v']),
+            )))
+
+        product_choices.sort(key=lambda i: str(i[1]))
+        return product_choices
+
+
+def i18ntostring(v):
+    if v.startswith('{'):
+        return LazyI18nString(json.loads(v))
+    return v
+
 
 class CapacityUtilizationReport(BaseMSLE):
     identifier = 'capacity_utilization'
@@ -68,12 +102,6 @@ class CapacityUtilizationReport(BaseMSLE):
         defdate_start = now().astimezone(get_current_timezone()).date()
         defdate_end = now().astimezone(get_current_timezone()).date() + timedelta(days=6)
 
-        # product_choices = []
-        # for r in Item.objects.filter(event__in=self.events, variations__isnull=True).values('name').distinct():
-        #    product_choices.append((str(r['name']), str(r['name'])))
-        # for r in ItemVariation.objects.filter(item__event__in=self.events).values('item__name', 'value').distinct():
-        #    product_choices.append(('{}#!#{}'.format(r['item__name'], r['value']), '{} – {}'.format(r['item__name'], r['value'])))
-
         f = OrderedDict(
             list(super().export_form_fields.items()) + [
                 ('date_from',
@@ -88,15 +116,12 @@ class CapacityUtilizationReport(BaseMSLE):
                      widget=forms.DateInput(attrs={'class': 'datepickerfield'}),
                      initial=defdate_end,
                  )),
-                # ('product_name',
-                #  forms.MultipleChoiceField(
-                #      label=_('Product and variation'),
-                #      choices=product_choices,
-                #      widget=forms.CheckboxSelectMultiple(
-                #          attrs={'class': 'scrolling-multiple-choice'}
-                #      ),
-                #      initial=[r[0] for r in product_choices]
-                #  )),
+                ('product_name',
+                 forms.ChoiceField(
+                     label=_('Product and variation'),
+                     choices=self.product_choices,
+                     required=False
+                 )),
             ]
         )
         if self.is_multievent and self.events.first():
@@ -185,6 +210,32 @@ class CapacityUtilizationReport(BaseMSLE):
             subevent__date_from__gte=self.datetime_from,
             subevent__date_from__lt=self.datetime_until,
         )
+        if form_data['product_name']:
+            qs = qs.annotate(
+                has_p=Exists(
+                    Quota.items.through.objects.annotate(
+                        n=Concat(Cast('item__name', output_field=CharField()), Value('#!#-')),
+                    ).filter(
+                        item__variations__isnull=True,
+                        quota=OuterRef('pk'),
+                        n=form_data['product_name']
+                    )
+                ),
+                has_v=Exists(
+                    Quota.variations.through.objects.annotate(
+                        n=Concat(
+                            Cast('itemvariation__item__name', output_field=CharField()),
+                            Value('#!#'),
+                            Cast('itemvariation__value', output_field=CharField()),
+                        )
+                    ).filter(
+                        quota=OuterRef('pk'),
+                        n=form_data['product_name']
+                    )
+                ),
+            ).filter(
+                Q(has_p=True) | Q(has_v=True)
+            )
 
         for i, n in enumerate([self.meta_name]):
             if 'meta:{}'.format(n) in form_data:
@@ -222,23 +273,17 @@ class CapacityUtilizationReport(BaseMSLE):
         if has_checkin:
             qs = qs.annotate(has_checkin=Exists(Checkin.objects.filter(position=OuterRef('pk')))).filter(has_checkin=True)
 
-        # item, variation
-        return qs
-
-    def _event_qs(self, form_data):
-        qs = self.events
-        for i, n in enumerate([self.meta_name]):
-            if 'meta:{}'.format(n) in form_data:
-                emv_with_value = EventMetaValue.objects.filter(
-                    event=OuterRef('pk'),
-                    property__name=n,
-                    value__in=form_data['meta:{}'.format(n)]
+        if form_data['product_name']:
+            qs = qs.annotate(
+                n=Concat(
+                    Cast('item__name', output_field=CharField()),
+                    Value('#!#'),
+                    Coalesce(Cast('variation__value', output_field=CharField()), Value('-'))
                 )
-                qs = qs.annotate(**{
-                    'attr_{}'.format(i): Exists(emv_with_value)
-                }).filter(**{
-                    'attr_{}'.format(i): True
-                })
+            ).filter(
+                Q(n=form_data['product_name'])
+            )
+
         return qs
 
     def _subevent_qs(self, form_data):
@@ -259,6 +304,33 @@ class CapacityUtilizationReport(BaseMSLE):
                 }).filter(**{
                     'attr_{}'.format(i): True
                 })
+
+        if form_data['product_name']:
+            qs = qs.annotate(
+                has_p=Exists(
+                    Quota.items.through.objects.annotate(
+                        n=Concat(Cast('item__name', output_field=CharField()), Value('#!#-')),
+                    ).filter(
+                        item__variations__isnull=True,
+                        quota__subevent=OuterRef('pk'),
+                        n=form_data['product_name']
+                    )
+                ),
+                has_v=Exists(
+                    Quota.variations.through.objects.annotate(
+                        n=Concat(
+                            Cast('itemvariation__item__name', output_field=CharField()),
+                            Value('#!#'),
+                            Cast('itemvariation__value', output_field=CharField()),
+                        )
+                    ).filter(
+                        quota__subevent=OuterRef('pk'),
+                        n=form_data['product_name']
+                    )
+                ),
+            ).filter(
+                Q(has_p=True) | Q(has_v=True)
+            )
         return qs
 
     def _date_iter(self):
@@ -289,7 +361,7 @@ class CapacityUtilizationReport(BaseMSLE):
             for e in events:
                 for dt in self._date_iter():
                     subevcnt = subevs.get((dt, e.pk), 0)
-                    if not subevcnt:
+                    if e.has_subevents and not subevcnt:
                         continue
                     yield [
                         dt.strftime('%m/%d/%Y'),
@@ -319,7 +391,7 @@ class CapacityUtilizationReport(BaseMSLE):
         for mv in meta_values:
             events = sorted([e for e in self.cached_events if e.meta_data[self.meta_name] == mv], key=lambda e: str(e.name))
             for dt in self._date_iter():
-                evcnt = sum((1 if subevs.get((dt, e.pk), 0) else 0 for e in events), start=0)
+                evcnt = sum((1 if not e.has_subevents or subevs.get((dt, e.pk), 0) else 0 for e in events), start=0)
                 if not evcnt:
                     continue
                 yield [
@@ -468,12 +540,6 @@ class CapacityCreationReport(BaseMSLE):
         defdate_start = now().astimezone(get_current_timezone()).date()
         defdate_end = now().astimezone(get_current_timezone()).date() + timedelta(days=6)
 
-        # product_choices = []
-        # for r in Item.objects.filter(event__in=self.events, variations__isnull=True).values('name').distinct():
-        #    product_choices.append((str(r['name']), str(r['name'])))
-        # for r in ItemVariation.objects.filter(item__event__in=self.events).values('item__name', 'value').distinct():
-        #    product_choices.append(('{}#!#{}'.format(r['item__name'], r['value']), '{} – {}'.format(r['item__name'], r['value'])))
-
         f = OrderedDict(
             list(super().export_form_fields.items()) + [
                 ('date_from',
@@ -488,15 +554,6 @@ class CapacityCreationReport(BaseMSLE):
                      widget=forms.DateInput(attrs={'class': 'datepickerfield'}),
                      initial=defdate_end,
                  )),
-                # ('product_name',
-                #  forms.MultipleChoiceField(
-                #      label=_('Product and variation'),
-                #      choices=product_choices,
-                #      widget=forms.CheckboxSelectMultiple(
-                #          attrs={'class': 'scrolling-multiple-choice'}
-                #      ),
-                #      initial=[r[0] for r in product_choices]
-                #  )),
             ]
         )
         if self.is_multievent and self.events.first():
@@ -599,6 +656,7 @@ class CapacityCreationReport(BaseMSLE):
         ).order_by(
             'creation_date', 'meta_value'
         )
+
         for r in qs:
             yield [
                 r['creation_date'].strftime('%m/%d/%Y'),
