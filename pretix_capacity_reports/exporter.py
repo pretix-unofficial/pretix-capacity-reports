@@ -253,19 +253,19 @@ class CapacityUtilizationReport(MultiSheetListExporter):
         for mv in meta_values:
             events = sorted([e for e in self.cached_events if e.meta_data[self.meta_name] == mv], key=lambda e: str(e.name))
             for e in events:
-                dt = self.date_from
-                while dt <= self.date_until:
+                for dt in self._date_iter():
+                    subevcnt = subevs.get((dt, e.pk), 0)
+                    if not subevcnt:
+                        continue
                     yield [
                         dt.strftime('%m/%d/%Y'),
                         mv,
                         e.slug,
-                        subevs.get((dt, e.pk), 0),
+                        subevcnt,
                         quotas.get((dt, e.pk), 0) or 0,
                         orders.get((dt, e.pk), 0),
                         checkins.get((dt, e.pk), 0),
                     ]
-
-                    dt += timedelta(days=1)
 
     def prepare_xlsx_sheet_date_agency_event(self, ws):
         ws.freeze_panes = 'A2'
@@ -285,10 +285,13 @@ class CapacityUtilizationReport(MultiSheetListExporter):
         for mv in meta_values:
             events = sorted([e for e in self.cached_events if e.meta_data[self.meta_name] == mv], key=lambda e: str(e.name))
             for dt in self._date_iter():
+                evcnt = sum((1 if subevs.get((dt, e.pk), 0) else 0 for e in events), start=0)
+                if not evcnt:
+                    continue
                 yield [
                     dt.strftime('%m/%d/%Y'),
                     mv,
-                    sum((1 if subevs.get((dt, e.pk), 0) else 0 for e in events), start=0),
+                    evcnt,
                     sum((quotas.get((dt, e.pk), 0) or 0 for e in events), start=0),
                     sum((orders.get((dt, e.pk), 0) for e in events), start=0),
                     sum((checkins.get((dt, e.pk), 0) for e in events), start=0),
