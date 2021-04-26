@@ -93,6 +93,7 @@ class CapacityUtilizationReport(BaseMSLE):
     sheets = [
         ('date_agency_event', _('By date, agency, and event')),
         ('date_agency', _('By date and agency')),
+        ('date_time_agency_event', _('By time slot, agency, event')),
         ('agency_date_day', _('By agency and day')),
         ('agency_date_week', _('By agency and week')),
     ]
@@ -350,6 +351,49 @@ class CapacityUtilizationReport(BaseMSLE):
             dt += timedelta(days=1)
         if current_week:
             yield current_week
+
+    def iterate_date_time_agency_event(self, form_data, meta_values, subevs, quotas, orders, checkins):
+        quotas = {
+            (r['dt'].astimezone(self.tz), r['event_id']): r['c'] for r in
+            self._base_quota_qs(form_data).filter(
+                size__isnull=False,
+            ).annotate(
+                dt=Coalesce('subevent__date_from', 'event__date_from'),
+            ).order_by().values('dt', 'event_id').annotate(c=Sum('size'))
+        }
+        orders = {
+            (r['dt'].astimezone(self.tz), r['order__event_id']): r['c'] for r in
+            self._base_position_qs(form_data).annotate(
+                dt=Coalesce('subevent__date_from', 'order__event__date_from'),
+            ).order_by().values('dt', 'order__event_id').annotate(c=Count('*'))
+        }
+        checkins = {
+            (r['dt'].astimezone(self.tz), r['order__event_id']): r['c'] for r in
+            self._base_position_qs(form_data, has_checkin=True).annotate(
+                dt=Coalesce('subevent__date_from', 'order__event__date_from'),
+            ).order_by().values('dt', 'order__event_id').annotate(c=Count('*'))
+        }
+
+        yield [
+            "Date of Event", "Time slot", self.meta_name, "Event ID", "Sum of Quota", "Sum of Orders", "Sum of Checked in"
+        ]
+
+        for mv in meta_values:
+            events = sorted([e for e in self.cached_events if e.meta_data[self.meta_name] == mv], key=lambda e: str(e.name))
+            for e in events:
+                time_slots = {r[0] for r in orders.keys() if r[1] == e.pk} | {r[0] for r in checkins.keys() if r[1] == e.pk} | {r[0] for r in quotas.keys() if r[1] == e.pk}
+                time_slots = sorted(list(time_slots))
+
+                for dt in time_slots:
+                    yield [
+                        dt.strftime('%m/%d/%Y'),
+                        dt.strftime('%I:%M %p'),
+                        mv,
+                        e.slug,
+                        quotas.get((dt, e.pk), 0) or 0,
+                        orders.get((dt, e.pk), 0),
+                        checkins.get((dt, e.pk), 0),
+                    ]
 
     def iterate_date_agency_event(self, form_data, meta_values, subevs, quotas, orders, checkins):
         yield [
