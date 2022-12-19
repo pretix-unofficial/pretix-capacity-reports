@@ -9,6 +9,7 @@ except ImportError:
 
 
 class PluginApp(PluginConfig):
+    default = True
     name = "pretix_capacity_reports"
     verbose_name = "Capacity reporting"
 
