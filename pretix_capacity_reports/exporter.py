@@ -293,7 +293,11 @@ class CapacityUtilizationReport(BaseMSLE):
                     'attr_{}'.format(i): True
                 })
         if has_checkin:
-            qs = qs.annotate(has_checkin=Exists(Checkin.objects.filter(position=OuterRef('pk')))).filter(has_checkin=True)
+            qs = qs.annotate(
+                has_checkin=Exists(
+                    Checkin.objects.filter(position=OuterRef('pk'), type=Checkin.TYPE_ENTRY, list__ignore_in_statistics=False)
+                )
+            ).filter(has_checkin=True)
 
         if form_data['product_name']:
             qs = qs.annotate(
@@ -698,7 +702,7 @@ class CapacityCreationReport(BaseMSLE):
             ),
             n_checkins=Subquery(
                 OrderPosition.objects.annotate(
-                    has_checkin=Exists(Checkin.objects.filter(position=OuterRef('pk')))
+                    has_checkin=Exists(Checkin.objects.filter(position=OuterRef('pk'), type=Checkin.TYPE_ENTRY, list__ignore_in_statistics=False))
                 ).filter(
                     has_checkin=True,
                     order__event=OuterRef('pk'),
